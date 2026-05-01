@@ -106,12 +106,24 @@ def _apply_steering(
     start: int,
     end: int,
     abs_start: int,
+    residual: torch.Tensor | None = None,
 ) -> None:
     """Apply all matching steering vectors to a token slice *in-place*.
 
     ``target`` is the (already-cloned) output tensor.  ``start``/``end``
     are batch-relative indices, ``abs_start`` is the absolute sequence
     position of the first token in ``target[start:end]``.
+
+    ``residual`` is the fused-residual addend that some vLLM decoder
+    layers carry as ``output[1]`` (e.g. Qwen3DecoderLayer, where
+    ``output[0]`` is the per-layer MLP delta and the residual sum is
+    fused into the next layer's input layernorm).  When provided and
+    ``cfg.norm_match`` is set, the reference for norm matching is
+    ``target + residual`` — the full post-residual stream, matching the
+    HF/training-time math ``h'_i = h_i + ‖h_i‖ · v_i / ‖v_i‖`` where
+    ``h_i`` is the residual stream, not the per-layer delta.  Without
+    this, fused-residual layers norm-match against the (typically much
+    smaller) MLP delta and the injected magnitude is scaled too low.
     """
     n_tokens = end - start
     for cfg in configs:
@@ -124,7 +136,10 @@ def _apply_steering(
             # 2D: broadcast to all positions
             v = vec.unsqueeze(0)
             if cfg.norm_match:
-                v = norm_match(target[start:end], v)
+                ref = target[start:end]
+                if residual is not None:
+                    ref = ref + residual[start:end]
+                v = norm_match(ref, v)
             target[start:end] = target[start:end] + v * cfg.scale
         else:
             # 3D: position-specific
@@ -142,7 +157,10 @@ def _apply_steering(
                 rel = abs_pos - abs_start + start
                 v = vec[pi]
                 if cfg.norm_match:
-                    v = norm_match(target[rel], v)
+                    ref = target[rel]
+                    if residual is not None:
+                        ref = ref + residual[rel]
+                    v = norm_match(ref, v)
                 target[rel] = target[rel] + v * cfg.scale
 
 
@@ -205,12 +223,22 @@ def _hook_inner(
     # --- Phase 2: apply steering ------------------------------------
     modified_output: torch.Tensor | tuple[torch.Tensor, ...] | None = None
     if needs_steering:
+        residual: torch.Tensor | None
         if isinstance(output, tuple):
             modified_output = (output[0].clone(), output[1])
             target = modified_output[0]
+            # Some vLLM decoder layers (e.g. Qwen3) return
+            # ``(hidden_delta, residual)`` where ``residual`` is the
+            # fused-residual addend rolled into the next layer's
+            # input layernorm.  Pass it through so norm-matched
+            # steering can build the reference against the full
+            # post-residual stream (target + residual) rather than
+            # the per-layer delta alone — see ``_apply_steering``.
+            residual = output[1]
         else:
             modified_output = output.clone()
             target = modified_output
+            residual = None
 
         # Retrieve seq_lens for absolute position calculation.
         # seq_lens may be a tensor or a list depending on vLLM version.
@@ -230,7 +258,8 @@ def _hook_inner(
             else:
                 abs_start = 0  # fallback: treat as prefill from position 0
             _apply_steering(
-                per_req_steering[i], layer_idx, target, start, end, abs_start
+                per_req_steering[i], layer_idx, target, start, end, abs_start,
+                residual=residual,
             )
 
     # --- Phase 3: capture activations (rank 0 only) -----------------
