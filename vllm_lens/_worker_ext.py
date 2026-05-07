@@ -171,11 +171,13 @@ def _apply_steering(
         if layer_idx not in cfg.layer_index_map:
             continue
         act_idx = cfg.layer_index_map[layer_idx]
-        vec = cfg.activations[act_idx].to(target.dtype)  # (hidden,) or (n_pos, hidden)
+        # activations live on CPU to avoid filling VRAM with large position tensors;
+        # move only the needed slice to the target device at apply time.
+        vec = cfg.activations[act_idx]  # CPU: (hidden,) or (n_pos, hidden)
 
         if vec.dim() == 1:
             # 2D: broadcast to all positions
-            v = vec.unsqueeze(0)
+            v = vec.unsqueeze(0).to(device=target.device, dtype=target.dtype)
             if cfg.norm_match:
                 v = norm_match(target[start:end], v)
             target[start:end] = target[start:end] + v * cfg.scale
@@ -193,7 +195,7 @@ def _apply_steering(
                 if abs_pos < abs_start or abs_pos >= abs_end:
                     continue
                 rel = abs_pos - abs_start + start
-                v = vec[pi]
+                v = vec[pi].to(device=target.device, dtype=target.dtype)
                 if cfg.norm_match:
                     v = norm_match(target[rel], v)
                 target[rel] = target[rel] + v * cfg.scale
@@ -735,7 +737,7 @@ class HiddenStatesExtension:
             vectors.append(
                 sv.model_copy(
                     update={
-                        "activations": sv.activations.to(device=device, dtype=dtype)
+                        "activations": sv.activations.to(dtype=dtype)  # stay on CPU; moved to GPU per-position at apply time
                     }
                 )
             )
